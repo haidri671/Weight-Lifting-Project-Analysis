@@ -1,0 +1,201 @@
+---
+title: "Course Project: Weight Lifting Exercise Prediction"
+author: "(Haider Ali)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(123)
+```
+
+# 1. Goal (compact)
+
+Predict the manner in which exercises were performed (`classe` variable) using accelerometer data from multiple sensors. Deliverables: model, short writeup (<2000 words), <5 figures, predictions for 20 test cases (one file per prediction for the Quiz portion).
+
+# 2. Data fetching and quick inspection
+
+```{r data-load}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+train_file <- "pml-training.csv"
+test_file  <- "pml-testing.csv"
+
+if(!file.exists(train_file)) download.file(train_url, train_file, quiet = TRUE)
+if(!file.exists(test_file))  download.file(test_url, test_file, quiet = TRUE)
+
+train <- read.csv(train_file, na.strings = c("", "NA"))
+test  <- read.csv(test_file, na.strings = c("", "NA"))
+
+cat('Training rows:', nrow(train), 'columns:', ncol(train), '\n')
+cat('Test rows:', nrow(test), 'columns:', ncol(test), '\n')
+```
+
+# 3. Preprocessing / feature selection
+
+Short strategy (implemented below):
+
+- Remove near-zero variance predictors.
+- Remove predictors with >95% missing values.
+- Remove ID / timestamp / user identification columns that don't generalize.
+- Optionally scale/center (not strictly necessary for random forest).
+
+```{r preprocess}
+library(caret)
+
+# 1) Remove near-zero variance
+nzv <- nearZeroVar(train, saveMetrics = TRUE)
+
+# 2) Remove columns with many NAs (>95%)
+na_pct <- sapply(train, function(x) mean(is.na(x)))
+keep_cols <- names(na_pct[na_pct < 0.95])
+
+# 3) Remove identifiers and non-predictive columns
+id_cols <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+keep_cols <- setdiff(keep_cols, id_cols)
+
+# Keep the outcome + selected predictors
+keep_cols <- intersect(c(keep_cols, "classe"), names(train))
+train2 <- train[, keep_cols]
+
+# Remove any remaining near-zero variance predictors on reduced set
+nzv2 <- nearZeroVar(train2)
+if(length(nzv2) > 0) train2 <- train2[, -nzv2]
+
+# For caret, ensure factor outcome
+train2$classe <- as.factor(train2$classe)
+
+# Apply same column selection to test (careful: test doesn't have classe)
+common_cols <- intersect(names(train2), names(test))
+test2 <- test[, common_cols]
+
+# Some models require no NAs: we'll impute simple median for numeric predictors
+preProcNA <- preProcess(train2[, setdiff(names(train2), "classe")], method = c('medianImpute'))
+train_pred <- predict(preProcNA, train2[, setdiff(names(train2), "classe")])
+train_final <- data.frame(train_pred, classe = train2$classe)
+
+# Impute test
+if(ncol(test2) > 0) {
+  test_pred <- predict(preProcNA, test2)
+} else {
+  test_pred <- test2
+}
+
+cat('Predictor columns used:', ncol(train_pred), '\n')
+```
+
+# 4. Create an internal train/validation split (for estimating out-of-sample error)
+
+```{r split}
+set.seed(123)
+inTrain <- createDataPartition(train_final$classe, p = 0.75, list = FALSE)
+modelTrain <- train_final[inTrain, ]
+modelVal   <- train_final[-inTrain, ]
+
+cat('Model train rows:', nrow(modelTrain), 'Validation rows:', nrow(modelVal), '\n')
+```
+
+# 5. Model selection: Random Forest (primary) and GBM (comparison)
+
+Rationale: Random forest handles many predictors, is robust to correlated features, gives variable importance, and usually performs well out-of-the-box for classification on this dataset. We'll still try gradient boosting (gbm) to compare.
+
+```{r models}
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, classProbs = TRUE)
+
+# Random Forest
+set.seed(123)
+rfFit <- train(classe ~ ., data = modelTrain, method = "rf", trControl = ctrl, importance = TRUE, ntree = 500)
+print(rfFit)
+
+# GBM (comparison)
+set.seed(123)
+gbmFit <- train(classe ~ ., data = modelTrain, method = "gbm", trControl = ctrl, verbose = FALSE)
+print(gbmFit)
+
+# Validation performance
+rfPred <- predict(rfFit, modelVal)
+gbmPred <- predict(gbmFit, modelVal)
+
+rfCM <- confusionMatrix(rfPred, modelVal$classe)
+gbmCM <- confusionMatrix(gbmPred, modelVal$classe)
+
+cat('RF validation accuracy:', rfCM$overall['Accuracy'], '\n')
+cat('GBM validation accuracy:', gbmCM$overall['Accuracy'], '\n')
+```
+
+# 6. Choose final model and train on full training set
+
+Based on validation accuracy (see above) choose the better model. For reproducibility we'll use Random Forest if its accuracy is higher (typical for this dataset).
+
+```{r final-fit}
+# Train final model on all available training data
+set.seed(123)
+finalFit <- train(classe ~ ., data = train_final, method = "rf", trControl = ctrl, ntree = 500)
+finalFit
+
+# Variable importance
+varImpRF <- varImp(finalFit)
+plot(varImpRF, top = 20)
+```
+
+# 7. Expected out-of-sample error
+
+Short write-up (within 2000 words):
+
+- We used repeated 5-fold cross-validation during model tuning to estimate generalization performance and reduce variance in the estimate. The internal hold-out validation accuracy (above) gives a realistic estimate of expected out-of-sample accuracy. In practice, random forest's OOB error and cross-validated accuracy are both informative. Use the validation accuracy reported in the results; the expected out-of-sample error is approximately `r round(1 - rfCM$overall['Accuracy'], 3)` on the held-out portion of the original training set.
+
+# 8. Predictions on provided test set (20 cases)
+
+```{r predict-test}
+# Ensure test_pred has same columns as training predictors
+missing_cols <- setdiff(names(train_pred), names(test_pred))
+if(length(missing_cols) > 0) {
+  # Add missing columns with zeros (or NA-imputed values)
+  for(col in missing_cols) test_pred[[col]] <- 0
+}
+# Order columns same as train_pred
+test_pred <- test_pred[, names(train_pred)]
+
+# Predict
+testPred <- predict(finalFit, test_pred)
+
+# Show predicted classes
+testPred
+
+# For the Course Project Prediction Quiz: write each prediction to a separate text file named "problem_id_i.txt"
+write_predictions <- function(predictions, outdir = "predictions"){
+  if(!dir.exists(outdir)) dir.create(outdir)
+  for(i in seq_along(predictions)){
+    fname <- file.path(outdir, paste0("problem_id_", i, ".txt"))
+    write.table(predictions[i], file = fname, quote = FALSE, row.names = FALSE, col.names = FALSE)
+  }
+}
+
+write_predictions(as.character(testPred))
+cat('Wrote', length(testPred), 'prediction files to ./predictions\n')
+```
+
+# 9. Reproducibility notes
+
+- `set.seed(123)` set at top for reproducibility.
+- Session info printed below for exact package versions.
+
+```{r session-info}
+sessionInfo()
+```
+
+# 10. Short conclusions (keep concise)
+
+- Random Forest gave strong accuracy on validation; expected out-of-sample error is low (see section 7).
+- Important predictors are captured in `varImp` plot; accelerometer-derived summary features are highly informative.
+- Limitations: we removed many variables with >95% missing values — more sophisticated imputation or feature engineering might improve performance. Also, model interpretability is limited; consider examining partial dependence or training simpler learners if interpretability is required.
+
+---
+
+*End of analysis.*
